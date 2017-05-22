@@ -1,0 +1,159 @@
+#!/bin/ash -efu
+
+. shell-error
+. shell-signal
+
+docker_host="index.docker.io"
+def_docker_namespace="library"
+def_docker_tag="latest"
+
+repo="$1"; shift
+
+tag="$def_docker_tag"
+[ "$#" = 0 ] || { tag="$1"; shift; }
+
+scope="pull"
+[ "$#" = 0 ] || { scope="$1"; shift; }
+
+[ -z "${repo##*/*}" ] || repo="$def_docker_namespace/$repo"
+
+imagedir="images/$repo/$tag"
+
+workdir=
+exit_handler()
+{
+	[ -z "$workdir" ] || rm -rf -- "$workdir"
+}
+
+get_auth_challenge()
+{
+	sed -r \
+		-e 's/^Www-Authenticate: Bearer (.*)\r$/\1/i' \
+		-e 't a' \
+		-e 'd' \
+		-e ': a' \
+		-e 's/,?([^[:space:],=]+="[^"]+")/\1 /g'
+}
+
+get_token_v2()
+{
+	local n realm service
+
+	realm=
+	service=
+
+	for n in $(curl -sL -o /dev/null -D- "https://$docker_host/v2/" | get_auth_challenge); do
+		[ -n "$realm" ] || [ -n "${n##realm=*}" ] || {
+			realm="${n#realm=\"}"
+			realm="${realm%\"}"
+		}
+		[ -n "$service" ] || [ -n "${n##service=*}" ] || {
+			service="${n#service=\"}"
+			service="${service%\"}"
+		}
+	done
+
+	[ -n "$realm" ] && [ -n "$service" ] ||
+		fatal "unable to parse auth challenge"
+
+	curl -sL "$realm?service=$service&scope=repository:$repo:$scope" |
+		jq -r .token
+}
+
+token=
+
+pull_v2()
+{
+	local try=1 status= tempfile= url_suffix="$1" outfile="${2:-}"
+
+	if [ -z "$outfile" ]; then
+		tempfile="$workdir/body"
+	else
+		tempfile="$(mktemp "$outfile.XXXXXX")"
+	fi
+
+	while :; do
+		:> "$workdir/HEADERS"
+		message "Try #$try ..."
+
+		curl -sL \
+			-H "Accept: application/vnd.docker.distribution.manifest.v1+json" \
+			-H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+			${token:+-H "Authorization: Bearer $token"} \
+			-D "$workdir/HEADERS" -o "$tempfile" \
+			"https://$docker_host/v2/$repo/$url_suffix"
+
+		status="$(sed -n -r -e 's,^HTTP/1.1 ([0-9]+) .*$,\1,p' "$workdir/HEADERS")"
+		status="${status##*
+}"
+
+		case "$status" in
+			2*)
+				if [ -n "$outfile" ]; then
+					mv -f -- "$tempfile" "$outfile"
+					tempfile=
+				else
+					cat -- "$tempfile"
+				fi
+				break
+				;;
+			401)
+				message "Got $status and need to get new token..."
+				;;
+			4*|5*)
+				message "Got $status fatal error..."
+				cat -- "$tempfile"
+				break
+				;;
+		esac
+
+		token="$(get_token_v2)"
+		try=$(($try+1))
+	done
+
+	[ -z "$tempfile" ] ||
+		rm -f -- "$tempfile"
+}
+
+pull_manifest()
+{
+	pull_v2 "manifests/$1"
+}
+
+pull_blob()
+{
+	pull_v2 "blobs/$1" "$2"
+}
+
+set_cleanup_handler exit_handler
+workdir="$(mktemp -dt "$PROG.XXXXXXXXX")"
+
+message "pulling $repo:$tag ($scope)"
+
+rm -rf -- "$imagedir"
+mkdir -p -- "$imagedir"
+
+manifest="$imagedir/manifest.json"
+
+message "fetching manifest ..."
+pull_manifest "$tag" > "$manifest"
+
+version="$(jq -r .schemaVersion "$manifest")"
+case "$version" in
+	1)
+		jq -r .fsLayers[].blobSum "$manifest"
+		;;
+	2)
+		jq -r .layers[].digest "$manifest"
+		;;
+	*)
+		fatal "unsupported manifest version: $version"
+		;;
+esac >"$workdir/layers"
+
+while read digest; do
+	i=${i:-0}
+	message "fetching $digest ..."
+	pull_blob "$digest" "$imagedir/layer-$i.tar.gz"
+	i=$(($i+1))
+done < "$workdir/layers"
