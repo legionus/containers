@@ -1,0 +1,28 @@
+#!/bin/sh
+
+dbdir="db"
+imagedir="$dbdir/images"
+blobdir="$dbdir/blobs"
+containerdir="$dbdir/containers"
+
+docker_host="index.docker.io"
+def_docker_namespace="library"
+def_docker_tag="latest"
+
+repo=
+tag=
+parse_imagespec()
+{
+	local imagespec="$1"
+	repo=
+	tag="$def_docker_tag"
+
+	if [ -z "${imagespec##*:*}" ]; then
+		repo="${imagespec%%:*}"
+		tag="${imagespec##*:}"
+	else
+		repo="$imagespec"
+	fi
+
+	[ -z "${repo##*/*}" ] || repo="$def_docker_namespace/$repo"
+}

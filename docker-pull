@@ -3,26 +3,19 @@
 . shell-error
 . shell-signal
 
-docker_host="index.docker.io"
-def_docker_namespace="library"
-def_docker_tag="latest"
+. ./functions
 
-repo="$1"; shift
-
-tag="$def_docker_tag"
-[ "$#" = 0 ] || { tag="$1"; shift; }
+pid="$$"
+dockerspec="$1"
 
 scope="pull"
 [ "$#" = 0 ] || { scope="$1"; shift; }
 
-[ -z "${repo##*/*}" ] || repo="$def_docker_namespace/$repo"
+parse_imagespec
 
-imagedir="images/$repo/$tag"
-
-workdir=
 exit_handler()
 {
-	[ -z "$workdir" ] || rm -rf -- "$workdir"
+	find "$dbdir" -name "$pid.*" -delete
 }
 
 get_auth_challenge()
@@ -64,37 +57,26 @@ token=
 
 pull_v2()
 {
-	local try=1 status= tempfile= url_suffix="$1" outfile="${2:-}"
+	local headers= status= url_suffix="$1" outfile="$2"
 
-	if [ -z "$outfile" ]; then
-		tempfile="$workdir/body"
-	else
-		tempfile="$(mktemp "$outfile.XXXXXX")"
-	fi
+	headers="$(mktemp "$imagedir/$repo/$tag/$pid.HEADERS.XXXXXXXXX")" ||
+		return 1
 
 	while :; do
-		:> "$workdir/HEADERS"
-		message "Try #$try ..."
+		:> "$headers"
 
 		curl -sL \
 			-H "Accept: application/vnd.docker.distribution.manifest.v1+json" \
 			-H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
 			${token:+-H "Authorization: Bearer $token"} \
-			-D "$workdir/HEADERS" -o "$tempfile" \
-			"https://$docker_host/v2/$repo/$url_suffix"
+			-D "$headers" -o "$outfile" \
+			"https://$docker_host/v2/$repo/$url_suffix" ||:
 
-		status="$(sed -n -r -e 's,^HTTP/1.1 ([0-9]+) .*$,\1,p' "$workdir/HEADERS")"
+		status="$(sed -n -r -e 's,^HTTP/1.1 ([0-9]+) .*$,\1,p' "$headers")"
 		status="${status##*
 }"
-
 		case "$status" in
 			2*)
-				if [ -n "$outfile" ]; then
-					mv -f -- "$tempfile" "$outfile"
-					tempfile=
-				else
-					cat -- "$tempfile"
-				fi
 				break
 				;;
 			401)
@@ -102,22 +84,21 @@ pull_v2()
 				;;
 			4*|5*)
 				message "Got $status fatal error..."
-				cat -- "$tempfile"
-				break
+				return 1
+				;;
+			*)
+				message "Unknown error"
+				return 1
 				;;
 		esac
 
 		token="$(get_token_v2)"
-		try=$(($try+1))
 	done
-
-	[ -z "$tempfile" ] ||
-		rm -f -- "$tempfile"
 }
 
 pull_manifest()
 {
-	pull_v2 "manifests/$1"
+	pull_v2 "manifests/$1" "$2"
 }
 
 pull_blob()
@@ -125,35 +106,61 @@ pull_blob()
 	pull_v2 "blobs/$1" "$2"
 }
 
+check_digest()
+{
+	local checksum digest="$1" file="$2"
+	case "$digest" in
+		sha256:*)
+			checksum="$(sha256sum < "$file")"
+			checksum="${checksum%% *}"
+			;;
+		*)
+			message "unsupported digest: ${digest%%:*}"
+			return 1
+			;;
+	esac
+	[ "$checksum" = "${digest#*:}" ] ||
+		return 1
+}
+
 set_cleanup_handler exit_handler
-workdir="$(mktemp -dt "$PROG.XXXXXXXXX")"
 
 message "pulling $repo:$tag ($scope)"
-
-rm -rf -- "$imagedir"
-mkdir -p -- "$imagedir"
-
-manifest="$imagedir/manifest.json"
+mkdir -p -- "$blobdir" "$imagedir/$repo/$tag"
 
 message "fetching manifest ..."
-pull_manifest "$tag" > "$manifest"
+
+manifest="$(mktemp "$imagedir/$repo/$tag/$pid.XXXXXXXXX")"
+pull_manifest "$tag" "$manifest"
+
+layerlist="$imagedir/$repo/$tag/$pid.layers.list"
 
 version="$(jq -r .schemaVersion "$manifest")"
 case "$version" in
-	1)
-		jq -r .fsLayers[].blobSum "$manifest"
-		;;
-	2)
-		jq -r .layers[].digest "$manifest"
-		;;
+	1) jq -r .fsLayers[].blobSum "$manifest" ;;
+	2) jq -r .layers[].digest    "$manifest" ;;
 	*)
 		fatal "unsupported manifest version: $version"
 		;;
-esac >"$workdir/layers"
+esac >"$layerlist"
 
 while read digest; do
-	i=${i:-0}
+	if [ -s "$blobdir/$digest" ]; then
+		message "fetching $digest (already have it) ..."
+		continue
+	fi
+
 	message "fetching $digest ..."
-	pull_blob "$digest" "$imagedir/layer-$i.tar.gz"
-	i=$(($i+1))
-done < "$workdir/layers"
+	payload="$(mktemp "$blobdir/$pid.XXXXXXXXX")"
+
+	pull_blob "$digest" "$payload"
+
+	check_digest "$digest" "$payload" ||
+		fatal "digest verification failed: $digest"
+
+	mv -f -- "$payload" "$blobdir/$digest"
+
+done <"$layerlist"
+
+mv -f -- "$layerlist" "$imagedir/$repo/$tag/layers.list"
+mv -f -- "$manifest"  "$imagedir/$repo/$tag/manifest.json"
